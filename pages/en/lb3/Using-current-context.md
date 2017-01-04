@@ -10,16 +10,6 @@ permalink: /doc/en/lb3/Using-current-context.html
 summary:
 ---
 
-{% include warning.html content="Using the current context feature is not recommended!
-
-The current implementation of loopback-context is based on the module [continuation-local-storage](https://www.npmjs.com/package/continuation-local-storage) 
-which is known to have many problems, (for example, see [issue #59](https://github.com/othiym23/node-continuation-local-storage/issues/59)).
-As a result, loopback-context does not work in many situations, as can be seen from issues reported in LoopBack's
-[issue tracker](https://github.com/strongloop/loopback/issues?utf8=%E2%9C%93&q=is%3Aissue%20getCurrentContext).
-
-See [loopback issue #1495](https://github.com/strongloop/loopback/issues/1495) updates and an alternative solution.
-" %}
-
 LoopBack applications sometimes need to access context information to implement the business logic, for example to:
 
 * Access the currently logged-in user.
@@ -27,139 +17,140 @@ LoopBack applications sometimes need to access context information to implement 
 
 A typical request to invoke a LoopBack model method travels through multiple layers with chains of asynchronous callbacks. It's not always possible to pass all the information through method parameters. 
 
-**See also**: [Example in LoopBack repository](https://github.com/strongloop/loopback/blob/master/example/context/app.js).
+In LoopBack 2.x, we have introduced current-context APIs which used the module
+[continuation-local-storage](https://www.npmjs.com/package/continuation-local-storage)
+to provide a context object preserved across asynchronous operations.
+Unfortunately, as we learned later, this module is not reliable and have many
+problems (for example, see [issue #59](https://github.com/othiym23/node-continuation-local-storage/issues/59)).
+As a result, our current-context feature does not work in many situations,
+as can be seen from issues reported in LoopBack's
+[issue tracker](https://github.com/strongloop/loopback/issues?utf8=%E2%9C%93&q=is%3Aissue%20getCurrentContext).
 
-## Error messages
+To address this problem, we have moved all current-context-related code to a
+standalone module [loopback-context](https://github.com/strongloop/loopback-context)
+and removed all current-context APIs in the version 3.0 (see
+[Release Notes](3.0-Release-Notes.html#current-context-api-and-middleware-removed) for
+more details).
 
-LoopBack 3.0 [removed current-context APIs](3.0-Release-Notes.html#current-context-api-and-middleware-removed).
-An application that uses current-context will print the following error message
-when it receives its first HTTP request:
+Having done that, we do recognize the need of accessing information like the
+currently logged-in user deep inside application logic, for example in
+[Operation Hooks](Operation-hooks.html). Until there is a reliable
+implementation of continuation-local-storage available for Node.js, we are
+recommending to explicitly pass any additional context via `options` parameter
+of (remote) methods.
 
-```
-Unhandled error for request GET /api/Users:
-Error: remoting.context option was removed in version 3.0.
-For more information, see https://loopback.io/doc/en/lb3/Using-current-context.html
-for more details.
-    at restApiHandler (.../node_modules/loopback/server/middleware/rest.js:44:15)
-    at Layer.handle [as handle_request] (.../node_modules/express/lib/router/layer.js:95:5)
-    ...
-```
+All built-in methods like
+[PersistedModel.find](http://apidocs.strongloop.com/loopback/#persistedmodel-find)
+or
+[PersistedModel.create](http://apidocs.strongloop.com/loopback/#persistedmodel-create)
+were already modified to accept an optional `options` argument.
 
-To remove this warning, disable the context middleware added by the built-in REST handler. Set the `remoting.context` property in `server/config.json` to **false**; for example:
+[Operation Hooks](Operation-hooks.html) expose the `options` argument
+as `context.options`.
 
-{% include code-caption.html content="server/config.json" %}
-```javascript
+The missing piece is how to initialize the `options` parameter when a method is
+invoked via REST API, and do it in a safe manner, so that clients cannot
+override sensitive information like the currently logged-in user.
+
+The solution we have adopted has two parts.
+
+## Annotate "options" parameter in remoting metadata
+
+Methods accepting an `options` argument should declare this argument in their
+remoting metadata and use a special value `optionsFromRequest` as the `http`
+mapping.
+
+```json
 {
-  "remoting": {
-    "context": false,
-    ...
-  },
-  ...
+  "arg": "options",
+  "type": "object",
+  "http": "optionsFromRequest"
 }
 ```
 
-If your application relies on `loopback.getCurrentContext`, rework your code to use `loopback-context` directly, per the following instructions.
+Under the hood, this "magic string" value is converted by `Model.remoteMethod`
+to a function that will be called by strong-remoting for each incoming request
+in order to build the value for this parameter.
 
-## Install loopback-context
+{% include tip.html content='
+Computed "accepts" parameters have been around for a while and they are well supported by LoopBack tooling. For example, the Swagger generator excludes computed properties from the API endpoint description. As a result, the "options" parameter will not be described in the Swagger documentation.
+' %}
 
-Add `loopback-context` to your project dependencies
+All built-in method have been already modified to include this new "options"
+parameter.
 
-```
-$ npm install --save loopback-context
-```
+{% include note.html content='
+In LoopBack 2.x, this feature is disabled by default for compatibility reasons.  You can enable it by adding `"injectOptionsFromRemoteContext": true` to your model JSON file.
+' %}
 
-## Configure context propagation
+## Customize the value provided to "options"
 
-To setup your LoopBack application to create a new context for each incoming HTTP request, configure `per-context` middleware in your `server/middleware.json` as follows:
+When strong-remoting is resolving the "options" argument, it will call model's
+method `createOptionsFromRemotingContext`. The default implementation of this
+method returns an object with a single property `accessToken` containing
+the `AccessToken` instance used to authenticate the request.
 
-```javascript
-{
-  "initial": {
-    "loopback-context#per-request": {},
-  }
-  ...
-}
-```
+There are several ways how to customize this value.
 
-{% include important.html content="By default, the HTTP req/res objects are not set onto the current context. You need to set `enableHttpContext` to true to enable automatic population of req/res objects.
-" %}
+### Override `createOptionsFromRemotingContext` in your model
 
-## Use the current context
-
-Once you've enabled context propagation, you can access the current context object using `LoopBackContext.getCurrentContext()`.
-The context will be available in middleware (if it is loaded after the context middleware), remoting hooks, model hooks, and custom methods.
-
-```javascript
-var LoopBackContext = require('loopback-context');
-
-MyModel.myMethod = function(cb) {
-  var ctx = LoopBackContext.getCurrentContext();
-  // Get the current access token
-  var accessToken = ctx && ctx.get('accessToken');
-  ...
-  // Set more information on current context
-  ctx.set('foo', { bar: 'val' } );
-
-  ...
-}
-```
-
-## Use current authenticated user in remote methods
-
-In advanced use cases, for example when you want to add custom middleware, you have to add the context middleware
-at the right position in the middleware chain (before the middleware that depends on `LoopBackContext.getCurrentContext`).
-
-{% include important.html content="
-
-`LoopBackContext.perRequest()` detects the situation when it is invoked multiple times on the same request and returns immediately in subsequent runs.
-
-" %}
-
-Here's sample code which uses a middleware function to place the currently authenticated user into the context so that remote methods may use it:
-
-{% include code-caption.html content="/server/server.js" %}
-```javascript
-...
-// -- Add your pre-processing middleware here --
-app.use(LoopBackContext.perRequest());
-app.use(loopback.token());
-app.use(function setCurrentUser(req, res, next) {
-  if (!req.accessToken) {
-    return next();
-  }
-  app.models.UserModel.findById(req.accessToken.userId, function(err, user) {
-    if (err) {
-      return next(err);
-    }
-    if (!user) {
-      return next(new Error('No user with this access token was found.'));
-    }
-    var loopbackContext = LoopBackContext.getCurrentContext();
-    if (loopbackContext) {
-      loopbackContext.set('currentUser', user);
-    }
-    next();
+```js
+MyModel.createOptionsFromRemotingContext = function(ctx) {
+  var base = this.base.createOptionsFromRemotingContext(ctx);
+  return extend(base, {
+    currentUserId: base.accessToken && base.accessToken.userId,
   });
-});
-
-// boot scripts mount components like REST API
-...
-```
-
-{% include code-caption.html content="/common/models/YourModel.js" %}
-```javascript
-var loopback = require('loopback');
-var LoopBackContext = require('loopback-context');
-module.exports = function(YourModel) {
-  ...
-  //remote method
-  YourModel.someRemoteMethod = function(arg1, arg2, cb) {
-    var ctx = LoopBackContext.getCurrentContext();
-    var currentUser = ctx && ctx.get('currentUser');
-    console.log('currentUser.username: ', currentUser.username); // voila!
-    ...
-    cb(null);
-  };
-  ...
 };
 ```
+
+A better approach is to write a mixin that overrides this method and that can
+be shared between multiple models.
+
+### Use a "beforeRemote" hook
+
+Because the "options" parameter is a regular method parameter, it can be
+accessed from remote hooks via `ctx.args.options`.
+
+```js
+MyModel.beforeRemote('saveOptions', function(ctx, unused, next) {
+  if (!ctx.args.options.accessToken) return next();
+  User.findById(ctx.args.options.accessToken.userId, function(err, user) {
+    if (err) return next(err);
+    ctx.args.options.currentUser = user;
+    next();
+  });
+})
+```
+
+Again, a hook like this can be reused by placing the code in a mixin.
+
+Note that remote hooks are executed in order controller by the framework, which
+may be different from the order in which you need to modify the options
+parameter and then read the modified values. Please use the next suggestion if
+this order matters in your application.
+
+### Use a custom strong-remoting phase
+
+Internally, strong-remoting uses phases similar to [Middleware
+Phases](https://loopback.io/doc/en/lb3/Defining-middleware.html). The framework
+defines two built-in phases: `auth` and `invoke`. All remote hooks are run in
+the second phase `invoke`.
+
+Applications can define a custom phase to run code before any remote hooks are
+invoked, such code can be placed in a boot script for example.
+
+```js
+module.exports = function(app) {
+  app.remotes().phases
+    .addBefore('invoke', 'options-from-request')
+    .use(function(ctx, next) {
+      if (!ctx.args.options.accessToken) return next();
+      User.findById(ctx.args.options.accessToken.userId, function(err, user) {
+        if (err) return next(err);
+        ctx.args.options.currentUser = user;
+        next();
+      });
+    });
+};
+```
+
