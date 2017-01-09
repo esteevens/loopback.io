@@ -17,26 +17,25 @@ LoopBack applications sometimes need to access context information to implement 
 
 A typical request to invoke a LoopBack model method travels through multiple layers with chains of asynchronous callbacks. It's not always possible to pass all the information through method parameters. 
 
-In LoopBack 2.x, we have introduced current-context APIs which used the module
+LoopBack 2.x introduced current-context APIs using the module
 [continuation-local-storage](https://www.npmjs.com/package/continuation-local-storage)
 to provide a context object preserved across asynchronous operations.
-Unfortunately, as we learned later, this module is not reliable and have many
-problems (for example, see [issue #59](https://github.com/othiym23/node-continuation-local-storage/issues/59)).
-As a result, our current-context feature does not work in many situations,
-as can be seen from issues reported in LoopBack's
-[issue tracker](https://github.com/strongloop/loopback/issues?utf8=%E2%9C%93&q=is%3Aissue%20getCurrentContext).
+Unfortunately, this module is not reliable and has many known problems (for
+example, see [issue #59](https://github.com/othiym23/node-continuation-local-storage/issues/59)).
+As a result, the current-context feature does not work in many situations,
+see [loopback-context issues](https://github.com/strongloop/loopback-context/issues)
+and [related issues in loopback](https://github.com/strongloop/loopback/issues?utf8=%E2%9C%93&q=is%3Aissue%20getCurrentContext).
 
-To address this problem, we have moved all current-context-related code to a
-standalone module [loopback-context](https://github.com/strongloop/loopback-context)
-and removed all current-context APIs in the version 3.0 (see
-[Release Notes](3.0-Release-Notes.html#current-context-api-and-middleware-removed) for
-more details).
+To address this problem, LoopBack 3.0 moves all current-context-related code to
+[loopback-context](https://github.com/strongloop/loopback-context) module
+and removed all current-context APIs (see
+[Release Notes](3.0-Release-Notes.html#current-context-api-and-middleware-removed)).
 
-Having done that, we do recognize the need of accessing information like the
-currently logged-in user deep inside application logic, for example in
-[Operation Hooks](Operation-hooks.html). Until there is a reliable
-implementation of continuation-local-storage available for Node.js, we are
-recommending to explicitly pass any additional context via `options` parameter
+However, applications clearly need to acces information like the currently
+logged-in user in application logic, for example in
+[Operation hooks](Operation-hooks.html). Until there is a reliable
+implementation of continuation-local-storage available for Node.js,
+explicitly pass any additional context via `options` parameter
 of (remote) methods.
 
 All built-in methods like
@@ -45,20 +44,20 @@ or
 [PersistedModel.create](http://apidocs.strongloop.com/loopback/#persistedmodel-create)
 were already modified to accept an optional `options` argument.
 
-[Operation Hooks](Operation-hooks.html) expose the `options` argument
+[Operation hooks](Operation-hooks.html) expose the `options` argument
 as `context.options`.
 
-The missing piece is how to initialize the `options` parameter when a method is
-invoked via REST API, and do it in a safe manner, so that clients cannot
-override sensitive information like the currently logged-in user.
-
-The solution we have adopted has two parts.
+You must safely initialize the `options` parameter when a method is invoked
+via REST API, ensuring that clients cannot override sensitive information like
+the currently logged-in user.  Doing so requires two steps:
+- Annotate "options" parameter in remoting metadata
+- Customize the value provided to "options"
 
 ## Annotate "options" parameter in remoting metadata
 
-Methods accepting an `options` argument should declare this argument in their
-remoting metadata and use a special value `optionsFromRequest` as the `http`
-mapping.
+Methods accepting an `options` argument must declare this argument in their
+remoting metadata and set the `http` property to the special string value
+`"optionsFromRequest"`.
 
 ```json
 {
@@ -68,29 +67,32 @@ mapping.
 }
 ```
 
-Under the hood, this "magic string" value is converted by `Model.remoteMethod`
+Under the hood, `Model.remoteMethod` converts this special string value
 to a function that will be called by strong-remoting for each incoming request
-in order to build the value for this parameter.
+to build the value for this parameter.
 
 {% include tip.html content='
-Computed "accepts" parameters have been around for a while and they are well supported by LoopBack tooling. For example, the Swagger generator excludes computed properties from the API endpoint description. As a result, the "options" parameter will not be described in the Swagger documentation.
+Computed "accepts" parameters have been around for a while and they are well supported by LoopBack tooling. For example, the [Swagger generator](Swagger-generator.htm) excludes computed properties from the API endpoint description. As a result, the "options" parameter will not be described in the Swagger documentation.
 ' %}
 
 All built-in method have been already modified to include this new "options"
 parameter.
 
 {% include note.html content='
-In LoopBack 2.x, this feature is disabled by default for compatibility reasons.  You can enable it by adding `"injectOptionsFromRemoteContext": true` to your model JSON file.
+In LoopBack 2.x, this feature is disabled by default for compatibility reasons.  To enable, add `"injectOptionsFromRemoteContext": true` to your model JSON file.
 ' %}
 
 ## Customize the value provided to "options"
 
-When strong-remoting is resolving the "options" argument, it will call model's
-method `createOptionsFromRemotingContext`. The default implementation of this
+When strong-remoting resolves the "options" argument, it calls model's
+`createOptionsFromRemotingContext` method. The default implementation of this
 method returns an object with a single property `accessToken` containing
 the `AccessToken` instance used to authenticate the request.
 
-There are several ways how to customize this value.
+There are several ways to customize this value:
+- Override `createOptionsFromRemotingContext` in your model.
+- Use a "beforeRemote" hook.
+- Use a custom strong-remoting phase.
 
 ### Override `createOptionsFromRemotingContext` in your model
 
@@ -108,8 +110,8 @@ be shared between multiple models.
 
 ### Use a "beforeRemote" hook
 
-Because the "options" parameter is a regular method parameter, it can be
-accessed from remote hooks via `ctx.args.options`.
+Because the "options" parameter is a regular method parameter, you can access
+it from remote hooks via `ctx.args.options`.
 
 ```js
 MyModel.beforeRemote('saveOptions', function(ctx, unused, next) {
@@ -124,15 +126,15 @@ MyModel.beforeRemote('saveOptions', function(ctx, unused, next) {
 
 Again, a hook like this can be reused by placing the code in a mixin.
 
-Note that remote hooks are executed in order controller by the framework, which
+Note that remote hooks are executed in order controlled by LoopBack framework, which
 may be different from the order in which you need to modify the options
 parameter and then read the modified values. Please use the next suggestion if
 this order matters in your application.
 
 ### Use a custom strong-remoting phase
 
-Internally, strong-remoting uses phases similar to [Middleware
-Phases](https://loopback.io/doc/en/lb3/Defining-middleware.html). The framework
+Internally, strong-remoting uses phases similar to [middleware
+phases](https://loopback.io/doc/en/lb3/Defining-middleware.html). The framework
 defines two built-in phases: `auth` and `invoke`. All remote hooks are run in
 the second phase `invoke`.
 
